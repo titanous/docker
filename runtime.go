@@ -110,9 +110,6 @@ func (runtime *Runtime) load(id string) (*Container, error) {
 	if container.ID != id {
 		return container, fmt.Errorf("Container %s is stored at %s", container.ID, id)
 	}
-	if container.State.IsRunning() {
-		container.State.SetGhost(true)
-	}
 	return container, nil
 }
 
@@ -162,7 +159,6 @@ func (runtime *Runtime) Register(container *Container) error {
 			utils.Debugf("Container %s was supposed to be running but is not.", container.ID)
 			if runtime.config.AutoRestart {
 				utils.Debugf("Restarting")
-				container.State.SetGhost(false)
 				container.State.SetStopped(0)
 				if err := container.Start(); err != nil {
 					return err
@@ -177,7 +173,11 @@ func (runtime *Runtime) Register(container *Container) error {
 		} else {
 			utils.Debugf("Reconnecting to container %v", container.ID)
 
-			if err := container.allocateNetwork(); err != nil {
+			// Setup logging of stdout and stderr to disk
+			container.runtime.LogToDisk(container.stdout, container.logPath("json"), "stdout")
+			container.runtime.LogToDisk(container.stderr, container.logPath("json"), "stderr")
+
+			if err := container.allocateNetwork(true); err != nil {
 				return err
 			}
 
