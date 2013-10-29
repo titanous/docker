@@ -240,6 +240,7 @@ func setupInitLayer(initLayer string) error {
 	for pth, typ := range map[string]string{
 		"/dev/pts":         "dir",
 		"/dev/shm":         "dir",
+		"/dev/console":     "file",
 		"/proc":            "dir",
 		"/sys":             "dir",
 		"/.dockerinit":     "file",
