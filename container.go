@@ -663,7 +663,7 @@ func (container *Container) Start() (err error) {
 
 	// FIXME: save state on disk *first*, then converge
 	// this way disk state is used as a journal, eg. we can restore after crash etc.
-	container.State.SetRunning(container.cmd.Process.Pid)
+	container.State.SetRunning()
 
 	// Init the locks
 	container.waitLock = make(chan struct{})

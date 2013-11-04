@@ -546,7 +546,7 @@ func TestRestore(t *testing.T) {
 	if err := container2.WaitTimeout(2 * time.Second); err != nil {
 		t.Fatal(err)
 	}
-	container2.State.SetRunning(42)
+	container2.State.SetRunning()
 	container2.ToDisk()
 
 	if len(runtime1.List()) != 2 {

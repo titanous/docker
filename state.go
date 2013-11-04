@@ -10,7 +10,6 @@ import (
 type State struct {
 	sync.RWMutex
 	Running    bool
-	Pid        int
 	ExitCode   int
 	StartedAt  time.Time
 	FinishedAt time.Time
@@ -41,13 +40,12 @@ func (s *State) GetExitCode() int {
 	return s.ExitCode
 }
 
-func (s *State) SetRunning(pid int) {
+func (s *State) SetRunning() {
 	s.Lock()
 	defer s.Unlock()
 
 	s.Running = true
 	s.ExitCode = 0
-	s.Pid = pid
 	s.StartedAt = time.Now().UTC()
 }
 
@@ -56,7 +54,6 @@ func (s *State) SetStopped(exitCode int) {
 	defer s.Unlock()
 
 	s.Running = false
-	s.Pid = 0
 	s.FinishedAt = time.Now().UTC()
 	s.ExitCode = exitCode
 }
