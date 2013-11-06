@@ -208,14 +208,18 @@ func dockerInitApp(args *DockerInitArgs) error {
 		return err
 	}
 
-	// Wait for it to exit
-	if err := cmd.Wait(); err != nil {
-		if _, ok := err.(*exec.ExitError); !ok {
-			return err
+	// Wait for the app to exit.  Also, as pid 1 it's our job to reap all
+	// orphaned zombies.
+	var wstatus syscall.WaitStatus
+	for {
+		var rusage syscall.Rusage
+		pid, err := syscall.Wait4(-1, &wstatus, 0, &rusage)
+		if err == nil && pid == cmd.Process.Pid {
+			break
 		}
 	}
-	exitCode := cmd.ProcessState.Sys().(syscall.WaitStatus).ExitStatus()
-	os.Exit(exitCode)
+
+	os.Exit(wstatus.ExitStatus())
 	return nil
 }
 
