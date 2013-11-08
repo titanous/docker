@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/dotcloud/docker/archive"
 	"github.com/dotcloud/docker/graphdriver"
+	"github.com/dotcloud/docker/sysinit"
 	"github.com/dotcloud/docker/term"
 	"github.com/dotcloud/docker/utils"
 	"github.com/kr/pty"
@@ -14,6 +15,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
+	"net/rpc"
 	"os"
 	"os/exec"
 	"path"
@@ -52,6 +54,7 @@ type Container struct {
 	ResolvConfPath string
 	HostnamePath   string
 	HostsPath      string
+	SharedPath     string
 	Name           string
 	Driver         string
 
@@ -72,6 +75,9 @@ type Container struct {
 	hostConfig *HostConfig
 
 	activeLinks map[string]*Link
+
+	dockerInitRpc *rpc.Client
+	rpcLock       chan struct{}
 }
 
 // Note: the Config structure should hold only portable information about the container.
@@ -701,15 +707,17 @@ func (container *Container) Start() (err error) {
 	if err != nil {
 		return err
 	}
+
 	// FIXME: save state on disk *first*, then converge
 	// this way disk state is used as a journal, eg. we can restore after crash etc.
 	container.State.SetRunning(container.cmd.Process.Pid)
 
-	// Init the lock
+	// Init the locks
 	container.waitLock = make(chan struct{})
+	container.rpcLock = make(chan struct{})
 
 	container.ToDisk()
-	go container.monitor()
+	go container.monitor(false)
 
 	defer utils.Debugf("Container running: %v", container.State.IsRunning())
 	// We wait for the container to be fully running.
@@ -743,6 +751,61 @@ func (container *Container) Start() (err error) {
 		return ErrContainerStartTimeout
 	}
 	return ErrContainerStart
+}
+
+func (container *Container) dockerInitRpcCall(method string, args, reply interface{}) error {
+
+	select {
+	case <-container.rpcLock:
+	case <-time.After(time.Second):
+		close(container.rpcLock)
+		return fmt.Errorf("timeout waiting for rpc connection")
+	}
+
+	if container.dockerInitRpc == nil {
+		return fmt.Errorf("no rpc connection to container")
+	}
+
+	return container.dockerInitRpc.Call("DockerInitRpc."+method, args, reply)
+}
+
+// Connect to the dockerinit RPC socket
+func (container *Container) connectToDockerInit(reconnect bool) error {
+
+	// We can't connect to the dockerinit RPC socket file directly because
+	// the path to it is longer than 108 characters (UNIX_PATH_MAX).
+	// Create a temporary symlink to connect to.
+	symlink := "/tmp/docker-rpc." + container.ID
+	os.Symlink(path.Join(container.SharedPath, sysinit.RpcSocketName), symlink)
+	defer os.Remove(symlink)
+
+	// Connect to the dockerinit RPC socket with a 1 second timeout
+	var err error
+	for startTime := time.Now(); time.Since(startTime) < time.Second; time.Sleep(10 * time.Millisecond) {
+		if container.dockerInitRpc, err = rpc.Dial("unix", symlink); err == nil {
+			break
+		}
+
+		if reconnect {
+			return fmt.Errorf("Container is no longer running")
+		}
+	}
+
+	if err != nil {
+		return err
+	}
+
+	close(container.rpcLock)
+
+	if !reconnect {
+		// Tell dockerinit to start the app now
+		var dummy1, dummy2 int
+		if err := container.dockerInitRpcCall("Resume", &dummy1, &dummy2); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (container *Container) getBindMap() (map[string]BindMap, error) {
@@ -1135,29 +1198,37 @@ func (container *Container) waitLxc() error {
 	}
 }
 
-func (container *Container) monitor() {
-	// Wait for the program to exit
-
-	// If the command does not exist, try to wait via lxc
-	// (This probably happens only for ghost containers, i.e. containers that were running when Docker started)
-	if container.cmd == nil {
-		utils.Debugf("monitor: waiting for container %s using waitLxc", container.ID)
-		if err := container.waitLxc(); err != nil {
-			utils.Errorf("monitor: while waiting for container %s, waitLxc had a problem: %s", container.ID, err)
-		}
-	} else {
-		utils.Debugf("monitor: waiting for container %s using cmd.Wait", container.ID)
-		if err := container.cmd.Wait(); err != nil {
-			// Since non-zero exit status and signal terminations will cause err to be non-nil,
-			// we have to actually discard it. Still, log it anyway, just in case.
-			utils.Debugf("monitor: cmd.Wait reported exit status %s for container %s", err, container.ID)
-		}
-	}
-	utils.Debugf("monitor: container %s finished", container.ID)
+// Wait for the program to exit
+func (container *Container) monitor(reconnect bool) {
 
 	exitCode := -1
-	if container.cmd != nil {
-		exitCode = container.cmd.ProcessState.Sys().(syscall.WaitStatus).ExitStatus()
+
+	// Connect to the dockerinit socket and wait for the exit code
+	if err := container.connectToDockerInit(reconnect); err != nil {
+		utils.Debugf("monitor: couldn't connect to dockerinit in container %s: %s", container.ID, err)
+	} else {
+		// Wait for it to exit...
+
+		// If the command does not exist, try to wait via lxc
+		// (This probably happens only for ghost containers, i.e. containers that were running when Docker started)
+		if container.cmd == nil {
+			utils.Debugf("monitor: waiting for container %s using waitLxc", container.ID)
+			if err := container.waitLxc(); err != nil {
+				// Discard the error as any signals or non 0 returns will generate an error
+				utils.Debugf("monitor: while waiting for container %s, waitLxc had a problem: %s", container.ID, err)
+			}
+		} else {
+			utils.Debugf("monitor: waiting for container %s using cmd.Wait", container.ID)
+			if err := container.cmd.Wait(); err != nil {
+				// Since non-zero exit status and signal terminations will cause err to be non-nil,
+				// we have to actually discard it. Still, log it anyway, just in case.
+				utils.Debugf("monitor: cmd.Wait reported exit status %s for container %s", err, container.ID)
+			}
+
+			exitCode = container.cmd.ProcessState.Sys().(syscall.WaitStatus).ExitStatus()
+		}
+
+		utils.Debugf("monitor: container %s finished", container.ID)
 	}
 
 	if container.runtime != nil && container.runtime.srv != nil {
@@ -1215,6 +1286,18 @@ func (container *Container) cleanup() {
 		if err := container.ptyMaster.Close(); err != nil {
 			utils.Errorf("%s: Error closing Pty master: %s", container.ID, err)
 		}
+	}
+
+	if container.dockerInitRpc != nil {
+		if err := container.dockerInitRpc.Close(); err != nil {
+			// FIXME: We have an FD leak caused by an apparent bug
+			// in net/rpc.  It isn't closing the socket when the
+			// connection gets closed by dockerinit before we get
+			// here.  So the rpc Close() call sees that the
+			// connection is closed and returns an error without
+			// actually closing the socket.
+		}
+		container.dockerInitRpc = nil
 	}
 
 	if err := container.Unmount(); err != nil {

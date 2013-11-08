@@ -85,8 +85,9 @@ lxc.mount.entry = devpts {{escapeFstabSpaces $ROOTFS}}/dev/pts devpts newinstanc
 #lxc.mount.entry = varlock {{escapeFstabSpaces $ROOTFS}}/var/lock tmpfs size=1024k,nosuid,nodev,noexec 0 0
 lxc.mount.entry = shm {{escapeFstabSpaces $ROOTFS}}/dev/shm tmpfs size=65536k,nosuid,nodev,noexec 0 0
 
-# Inject dockerinit
+# Inject dockerinit and shared socket dir
 lxc.mount.entry = {{escapeFstabSpaces .SysInitPath}} {{escapeFstabSpaces $ROOTFS}}/.dockerinit none bind,ro 0 0
+lxc.mount.entry = {{escapeFstabSpaces .SharedPath}} {{escapeFstabSpaces $ROOTFS}}/.docker-shared none bind,rw 0 0
 
 # Inject env
 lxc.mount.entry = {{escapeFstabSpaces .EnvConfigPath}} {{escapeFstabSpaces $ROOTFS}}/.dockerenv none bind,ro 0 0
