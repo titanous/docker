@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path"
 	"strconv"
 	"strings"
 	"syscall"
@@ -35,7 +36,6 @@ func setupHostname(args *DockerInitArgs) error {
 	return syscall.Sethostname([]byte(hostname))
 }
 
-// Setup networking
 func setupNetworking(args *DockerInitArgs) error {
 	if args.ip != "" {
 		// eth0
@@ -55,8 +55,7 @@ func setupNetworking(args *DockerInitArgs) error {
 		}
 
 		// loopback
-		iface, err = net.InterfaceByName("lo")
-		if err != nil {
+		if iface, err = net.InterfaceByName("lo"); err != nil {
 			return fmt.Errorf("Unable to set up networking: %v", err)
 		}
 		if err := netlink.NetworkLinkUp(iface); err != nil {
@@ -77,44 +76,25 @@ func setupNetworking(args *DockerInitArgs) error {
 	return nil
 }
 
-// Setup working directory
-func setupWorkingDirectory(args *DockerInitArgs) error {
-	if args.workDir == "" {
-		return nil
-	}
-	if err := syscall.Chdir(args.workDir); err != nil {
-		return fmt.Errorf("Unable to change dir to %v: %v", args.workDir, err)
-	}
-	return nil
-}
-
-// Takes care of dropping privileges to the desired user
-func changeUser(args *DockerInitArgs) error {
+func getCredential(args *DockerInitArgs) (*syscall.Credential, error) {
 	if args.user == "" {
-		return nil
+		return nil, nil
 	}
 	userent, err := utils.UserLookup(args.user)
 	if err != nil {
-		return fmt.Errorf("Unable to find user %v: %v", args.user, err)
+		return nil, fmt.Errorf("Unable to find user %v: %v", args.user, err)
 	}
 
 	uid, err := strconv.Atoi(userent.Uid)
 	if err != nil {
-		return fmt.Errorf("Invalid uid: %v", userent.Uid)
+		return nil, fmt.Errorf("Invalid uid: %v", userent.Uid)
 	}
 	gid, err := strconv.Atoi(userent.Gid)
 	if err != nil {
-		return fmt.Errorf("Invalid gid: %v", userent.Gid)
+		return nil, fmt.Errorf("Invalid gid: %v", userent.Gid)
 	}
 
-	if err := syscall.Setgid(gid); err != nil {
-		return fmt.Errorf("setgid failed: %v", err)
-	}
-	if err := syscall.Setuid(uid); err != nil {
-		return fmt.Errorf("setuid failed: %v", err)
-	}
-
-	return nil
+	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}, nil
 }
 
 func setupCapabilities(args *DockerInitArgs) error {
@@ -153,18 +133,6 @@ func setupCapabilities(args *DockerInitArgs) error {
 	return nil
 }
 
-// Clear environment pollution introduced by lxc-start
-func setupEnv(args *DockerInitArgs) {
-	os.Clearenv()
-	for _, kv := range args.env {
-		parts := strings.SplitN(kv, "=", 2)
-		if len(parts) == 1 {
-			parts = append(parts, "")
-		}
-		os.Setenv(parts[0], parts[1])
-	}
-}
-
 func getEnv(args *DockerInitArgs, key string) string {
 	for _, kv := range args.env {
 		parts := strings.SplitN(kv, "=", 2)
@@ -175,8 +143,46 @@ func getEnv(args *DockerInitArgs, key string) string {
 	return ""
 }
 
-func executeProgram(args *DockerInitArgs) error {
-	setupEnv(args)
+func getCmdPath(args *DockerInitArgs) (string, error) {
+
+	// Set PATH in dockerinit so we can find the cmd
+	if envPath := getEnv(args, "PATH"); envPath != "" {
+		os.Setenv("PATH", envPath)
+	}
+
+	// Find the cmd
+	cmdPath, err := exec.LookPath(args.args[0])
+	if err != nil {
+		if args.workDir == "" {
+			return "", err
+		}
+		if cmdPath, err = exec.LookPath(path.Join(args.workDir, args.args[0])); err != nil {
+			return "", err
+		}
+	}
+
+	return cmdPath, nil
+}
+
+// Run as pid 1 in the typical Docker usage: an app container that doesn't
+// need its own init process.  Running as pid 1 allows us to monitor the
+// container app and return its exit code.
+func dockerInitApp(args *DockerInitArgs) error {
+
+	// Prepare the cmd based on the given args
+	cmdPath, err := getCmdPath(args)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(cmdPath, args.args[1:]...)
+	cmd.Dir = args.workDir
+	cmd.Env = args.env
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// App runs in its own session
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := setupHostname(args); err != nil {
 		return err
@@ -190,25 +196,26 @@ func executeProgram(args *DockerInitArgs) error {
 		return err
 	}
 
-	if err := setupWorkingDirectory(args); err != nil {
-		return err
-	}
-
-	if err := changeUser(args); err != nil {
-		return err
-	}
-
-	path, err := exec.LookPath(args.args[0])
+	// Update uid/gid credentials if needed
+	credential, err := getCredential(args)
 	if err != nil {
-		log.Printf("Unable to locate %v", args.args[0])
-		os.Exit(127)
+		return err
+	}
+	cmd.SysProcAttr.Credential = credential
+
+	// Start the app
+	if err := cmd.Start(); err != nil {
+		return err
 	}
 
-	if err := syscall.Exec(path, args.args, os.Environ()); err != nil {
-		panic(err)
+	// Wait for it to exit
+	if err := cmd.Wait(); err != nil {
+		if _, ok := err.(*exec.ExitError); !ok {
+			return err
+		}
 	}
-
-	// Will never reach here
+	exitCode := cmd.ProcessState.Sys().(syscall.WaitStatus).ExitStatus()
+	os.Exit(exitCode)
 	return nil
 }
 
@@ -252,7 +259,7 @@ func SysInit() {
 		args:       flag.Args(),
 	}
 
-	if err := executeProgram(args); err != nil {
+	if err = dockerInitApp(args); err != nil {
 		log.Fatal(err)
 	}
 }
