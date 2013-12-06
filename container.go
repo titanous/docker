@@ -774,14 +774,14 @@ func (container *Container) getBindMap() (map[string]BindMap, error) {
 		}
 		binds[path.Clean(dst)] = bindMap
 	}
-  return binds, nil
+	return binds, nil
 }
 
 func (container *Container) createVolumes() error {
-  binds, err := container.getBindMap()
-  if err != nil {
-    return err
-  }
+	binds, err := container.getBindMap()
+	if err != nil {
+		return err
+	}
 	volumesDriver := container.runtime.volumes.driver
 	// Create the requested volumes if they don't exist
 	for volPath := range container.Config.Volumes {
