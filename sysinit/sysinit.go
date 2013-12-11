@@ -6,18 +6,20 @@ import (
 	"fmt"
 	"github.com/dotcloud/docker/netlink"
 	"github.com/dotcloud/docker/utils"
+	"github.com/guelfey/go.dbus"
+	"github.com/guelfey/go.dbus/introspect"
 	"github.com/kr/pty"
 	"github.com/syndtr/gocapability/capability"
 	"io/ioutil"
 	"log"
 	"net"
-	"net/rpc"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -36,138 +38,305 @@ type DockerInitArgs struct {
 }
 
 const SharedPath = "/.docker-shared"
-const RpcSocketName = "rpc.sock"
-const ConsoleSocketName = "con.sock"
+const DBusSocketName = "dbus.sock"
+const DockerInitPath = "/com/docker/DockerInit"
+const DockerInitInterface = "com.docker.DockerInit"
 
-func rpcSocketPath() string {
-	return path.Join(SharedPath, RpcSocketName)
+type State int32
+
+const (
+	Initial State = iota
+	Running
+	Exited
+	FailedToStart
+)
+
+// client side wrapper of the com.docker.DockerInit dbus interface
+type DockerInitWrapper struct {
+	obj         *dbus.Object
+	stateChange chan *dbus.Signal
+	conn        *dbus.Conn
 }
 
-func consoleSocketPath() string {
-	return path.Join(SharedPath, ConsoleSocketName)
-}
-
-type DockerInitRpc struct {
-	resume      chan int
-	cancel      chan int
-	exitCode    chan int
-	process     *os.Process
-	processLock chan struct{}
-}
-
-type DockerInitConsole struct {
-	stdin     *os.File
-	stdout    *os.File
-	stderr    *os.File
-	ptyMaster *os.File
-	openStdin bool
-}
-
-// RPC: Resume container start or container exit
-func (dockerInitRpc *DockerInitRpc) Resume(_ int, _ *int) error {
-	dockerInitRpc.resume <- 1
-	return nil
-}
-
-// RPC: Wait for container app exit and return the exit code.
-//
-// For machine containers that have their own init, this function doesn't
-// actually return, but that's ok.  The init process (pid 1) will die, which
-// will automatically kill all the other container tasks, including the
-// non-pid-1 dockerinit.  Docker's RPC Wait() call will detect that the socket
-// closed and return an error.
-func (dockerInitRpc *DockerInitRpc) Wait(_ int, exitCode *int) error {
-	select {
-	case *exitCode = <-dockerInitRpc.exitCode:
-	case <-dockerInitRpc.cancel:
-		*exitCode = -1
-	}
-	return nil
-}
-
-// RPC: Send a signal to the container app
-func (dockerInitRpc *DockerInitRpc) Signal(signal syscall.Signal, _ *int) error {
-	<-dockerInitRpc.processLock
-	return dockerInitRpc.process.Signal(signal)
-}
-
-// Serve RPC commands over a UNIX socket
-func rpcServer(dockerInitRpc *DockerInitRpc) {
-
-	if err := rpc.Register(dockerInitRpc); err != nil {
-		log.Fatal(err)
+func DockerInitWrap(conn *dbus.Conn) *DockerInitWrapper {
+	wrap := &DockerInitWrapper{
+		obj:  conn.Object("", DockerInitPath),
+		conn: conn,
 	}
 
-	os.Remove(rpcSocketPath())
-	addr := &net.UnixAddr{Net: "unix", Name: rpcSocketPath()}
-	listener, err := net.ListenUnix("unix", addr)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Printf("rpc socket accept error: %s", err)
-			continue
-		}
-
-		rpc.ServeConn(conn)
-
-		conn.Close()
-
-		// The RPC connection has closed, which means the docker daemon
-		// exited.  Cancel the Wait() call.
-		dockerInitRpc.cancel <- 1
-	}
+	wrap.stateChange = make(chan *dbus.Signal, 10)
+	conn.Signal(wrap.stateChange)
+	return wrap
 }
 
-// Send console FDs to docker over a UNIX socket
-func consoleFdServer(dockerInitConsole *DockerInitConsole) {
+func (wrap *DockerInitWrapper) Close() {
+	closed := false
 
-	os.Remove(consoleSocketPath())
-	addr := &net.UnixAddr{Net: "unix", Name: consoleSocketPath()}
-	listener, err := net.ListenUnix("unix", addr)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	for {
-		conn, err := listener.AcceptUnix()
-		if err != nil {
-			log.Printf("fd socket accept error: %s", err)
-			continue
-		}
-
-		dummy := []byte("1")
-		var fds []int
-		if dockerInitConsole.ptyMaster != nil {
-			fds = []int{int(dockerInitConsole.ptyMaster.Fd())}
-		} else {
-			fds = []int{
-				int(dockerInitConsole.stdout.Fd()),
-				int(dockerInitConsole.stderr.Fd())}
-
-			if dockerInitConsole.stdin != nil {
-				fds = append(fds, int(dockerInitConsole.stdin.Fd()))
+	// Its currently unsafe to close a connection multiple times (https://github.com/guelfey/go.dbus/issues/47)
+	// We check for the signal channel being closed to see if it is safe to close
+	eof := false
+	for !eof {
+		select {
+		case _, ok := <-wrap.stateChange:
+			if !ok {
+				closed = true
+				eof = true
 			}
+		default:
+			eof = true
 		}
-
-		rights := syscall.UnixRights(fds...)
-		if _, _, err := conn.WriteMsgUnix(dummy, rights, nil); err != nil {
-			log.Printf("%s", err)
-		}
-
-		// Only give stdin to the first caller and then close it on our
-		// side.  This gives the docker daemon the power to close the
-		// app's stdin in StdinOnce mode.
-		if dockerInitConsole.openStdin && dockerInitConsole.stdin != nil {
-			dockerInitConsole.stdin.Close()
-			dockerInitConsole.stdin = nil
-		}
-
-		conn.Close()
 	}
+	if !closed {
+		wrap.conn.Close()
+	}
+}
+
+func (wrap *DockerInitWrapper) WaitForStateChange() (State, string, int) {
+	s := <-wrap.stateChange
+
+	// Dockerinit died and closed the connection. This happens either
+	// if there is an internal error in .dockerinit, or in a machine-style
+	// container where pid1 dies. We treat this as if the container exited
+	// normally signalling error, as init dying is not expected in the
+	// machine-style container case.
+	if s == nil {
+		return Exited, "", 1
+	}
+
+	state, _ := s.Body[0].(int32)
+	errStr, _ := s.Body[1].(string)
+	exitStatus, _ := s.Body[1].(int32)
+
+	return State(state), errStr, int(exitStatus)
+}
+
+// Get the current state (started/running/exited
+func (wrap *DockerInitWrapper) GetState() (State, error) {
+	var res int32
+	err := wrap.obj.Call(DockerInitInterface+".GetState", 0).Store(&res)
+	return State(res), err
+}
+
+func (wrap *DockerInitWrapper) Resume() error {
+	return wrap.obj.Call(DockerInitInterface+".Resume", 0).Store()
+}
+
+func (wrap *DockerInitWrapper) GetPtyMaster() (*os.File, error) {
+	var fd dbus.UnixFD
+	if err := wrap.obj.Call(DockerInitInterface+".GetPtyMaster", 0).Store(&fd); err != nil {
+		return nil, err
+	}
+
+	// Hmm, shouldn't dbus do this?
+	syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), syscall.F_SETFD, syscall.FD_CLOEXEC)
+
+	return os.NewFile(uintptr(fd), "ptyMaster"), nil
+}
+
+func (wrap *DockerInitWrapper) GetStdOut() (*os.File, *os.File, error) {
+	var stdoutFd, stderrFd dbus.UnixFD
+	if err := wrap.obj.Call(DockerInitInterface+".GetStdOut", 0).Store(&stdoutFd, &stderrFd); err != nil {
+		return nil, nil, err
+	}
+
+	// Hmm, shouldn't dbus do this?
+	syscall.Syscall(syscall.SYS_FCNTL, uintptr(stdoutFd), syscall.F_SETFD, syscall.FD_CLOEXEC)
+	syscall.Syscall(syscall.SYS_FCNTL, uintptr(stderrFd), syscall.F_SETFD, syscall.FD_CLOEXEC)
+
+	return os.NewFile(uintptr(stdoutFd), "stdout"), os.NewFile(uintptr(stderrFd), "stderr"), nil
+}
+
+func (wrap *DockerInitWrapper) GetStdIn() (*os.File, error) {
+	var fd dbus.UnixFD
+	if err := wrap.obj.Call(DockerInitInterface+".GetStdIn", 0).Store(&fd); err != nil {
+		return nil, err
+	}
+
+	// Hmm, shouldn't dbus do this?
+	syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), syscall.F_SETFD, syscall.FD_CLOEXEC)
+
+	return os.NewFile(uintptr(fd), "stdin"), nil
+}
+
+func (wrap *DockerInitWrapper) Signal(signal int) error {
+	return wrap.obj.Call(DockerInitInterface+".Signal", 0, int32(signal)).Store()
+}
+
+func dbusSocketPath() string {
+	return path.Join(SharedPath, DBusSocketName)
+}
+
+type DockerInit struct {
+	sync.Mutex
+	introspectable introspect.Introspectable
+	state          State
+	resume         chan int
+	exitStatus     int32
+	error          string
+	process        *os.Process
+	stdin          *os.File
+	stdout         *os.File
+	stderr         *os.File
+	ptyMaster      *os.File
+	openStdin      bool
+	connections    []*dbus.Conn
+}
+
+func wrap(err error) *dbus.Error {
+	return &dbus.Error{
+		"com.docker.Error.Generic",
+		[]interface{}{err.Error()},
+	}
+}
+
+// Get the current state (started/running/exited
+func (init *DockerInit) GetState() (int32, *dbus.Error) {
+	init.Lock()
+	defer init.Unlock()
+	return int32(init.state), nil
+}
+
+// Get the exit code (or -1 if running)
+func (init *DockerInit) GetExitStatus() (int32, *dbus.Error) {
+	init.Lock()
+	defer init.Unlock()
+	return init.exitStatus, nil
+}
+
+func (init *DockerInit) Resume() *dbus.Error {
+	init.Lock()
+	defer init.Unlock()
+	init.resume <- 1
+	return nil
+}
+
+// Send a signal to the container app
+func (init *DockerInit) Signal(signal int32) *dbus.Error {
+	init.Lock()
+	defer init.Unlock()
+	if err := init.process.Signal(syscall.Signal(signal)); err != nil {
+		return wrap(err)
+	}
+	return nil
+}
+
+func (init *DockerInit) GetPtyMaster() (dbus.UnixFD, *dbus.Error) {
+	init.Lock()
+	defer init.Unlock()
+
+	if init.ptyMaster == nil {
+		return dbus.UnixFD(-1), &dbus.Error{
+			"com.docker.Error.NoPty",
+			[]interface{}{"No pty in this container"}}
+	}
+
+	return dbus.UnixFD(init.ptyMaster.Fd()), nil
+}
+
+func (init *DockerInit) GetStdOut() (dbus.UnixFD, dbus.UnixFD, *dbus.Error) {
+	init.Lock()
+	defer init.Unlock()
+
+	return dbus.UnixFD(init.stdout.Fd()), dbus.UnixFD(init.stderr.Fd()), nil
+}
+
+func (init *DockerInit) GetStdIn() (dbus.UnixFD, *dbus.Error) {
+	init.Lock()
+	defer init.Unlock()
+
+	if init.stdin == nil {
+		return dbus.UnixFD(-1), &dbus.Error{
+			"com.docker.Error.NoStdin",
+			[]interface{}{"Stdin is closed"}}
+	}
+
+	res := dbus.UnixFD(init.stdin.Fd())
+
+	// Only give stdin to the first caller and then close it on our
+	// side.  This gives the docker daemon the power to close the
+	// app's stdin in StdinOnce mode.
+	if init.openStdin {
+		init.stdin.Close()
+		init.stdin = nil
+	}
+
+	return res, nil
+}
+
+func (init *DockerInit) GotConnection(server dbus.Server, conn *dbus.Conn) {
+	init.Lock()
+	defer init.Unlock()
+	conn.Export(init, DockerInitPath, DockerInitInterface)
+	conn.Export(init.introspectable, DockerInitPath, "org.freedesktop.DBus.Introspectable")
+	// TODO: handle close and remove these
+	if err := conn.ServerAuth(nil, server.Uuid()); err != nil {
+		conn.Close()
+		return
+	}
+	init.connections = append(init.connections, conn)
+
+	// Always emit the "last" state change if you connect to a container so that we can
+	// keep track of state changes atomically
+	conn.Emit(DockerInitPath, "com.docker.DockerInit.StateChanged", init.state, init.error, init.exitStatus)
+}
+
+// Caller must hold lock
+func (init *DockerInit) changeState(state State, err string, exitStatus int32) {
+	init.state = state
+	init.error = err
+	init.exitStatus = exitStatus
+	for _, conn := range init.connections {
+		conn.Emit(DockerInitPath, "com.docker.DockerInit.StateChanged", init.state, err, exitStatus)
+	}
+}
+
+func dockerInitNew(args *DockerInitArgs) *DockerInit {
+	init := &DockerInit{
+		exitStatus: -1,
+		openStdin:  args.openStdin,
+		resume:     make(chan int),
+	}
+
+	introspectData := &introspect.Node{
+		Name: DockerInitPath,
+		Interfaces: []introspect.Interface{
+			introspect.IntrospectData,
+			introspect.Interface{
+				Name:    DockerInitInterface,
+				Methods: introspect.Methods(init),
+				Signals: []introspect.Signal{
+					{
+						Name: "StateChanged",
+						Args: []introspect.Arg{
+							{"state", "i", "out"},
+							{"error", "s", "out"},
+							{"exit_status", "i", "out"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	init.introspectable = introspect.NewIntrospectable(introspectData)
+
+	return init
+}
+
+func runDbusServer(init *DockerInit) error {
+	path := dbusSocketPath()
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	server, err := dbus.NewServer("unix:path="+path /* uuid */, "1234567890123456")
+	if err != nil {
+		return err
+	}
+
+	go dbus.Serve(server, init)
+
+	return nil
 }
 
 func setupHostname(args *DockerInitArgs) error {
@@ -323,49 +492,45 @@ func getCmdPath(args *DockerInitArgs) (string, error) {
 	return cmdPath, nil
 }
 
-// Start the RPC and console FD servers and wait for docker to tell us to
-// resume starting the container.  This gives docker a chance to get the
-// console FDs before we start so that it won't miss any console output.
-func startServersAndWait(dockerInitRpc *DockerInitRpc, dockerInitConsole *DockerInitConsole) error {
+func babySit(process *os.Process) int {
 
-	go consoleFdServer(dockerInitConsole)
-	go rpcServer(dockerInitRpc)
+	// Forward all signals to the app
+	sigchan := make(chan os.Signal, 1)
+	utils.CatchAll(sigchan)
+	go func() {
+		for sig := range sigchan {
+			if sig == syscall.SIGCHLD {
+				continue
+			}
+			process.Signal(sig)
+		}
+	}()
 
-	select {
-	case <-dockerInitRpc.resume:
-		break
-	case <-time.After(time.Second):
-		return fmt.Errorf("timeout waiting for docker Resume()")
+	// Wait for the app to exit.  Also, as pid 1 it's our job to reap all
+	// orphaned zombies.
+	var wstatus syscall.WaitStatus
+	for {
+		var rusage syscall.Rusage
+		pid, err := syscall.Wait4(-1, &wstatus, 0, &rusage)
+		if err == nil && pid == process.Pid {
+			break
+		}
 	}
 
-	return nil
-}
-
-func dockerInitRpcNew() *DockerInitRpc {
-	return &DockerInitRpc{
-		resume:      make(chan int),
-		exitCode:    make(chan int),
-		cancel:      make(chan int),
-		processLock: make(chan struct{}),
-	}
-}
-
-func dockerInitConsoleNew(args *DockerInitArgs) *DockerInitConsole {
-	return &DockerInitConsole{
-		openStdin: args.openStdin,
-	}
+	return wstatus.ExitStatus()
 }
 
 // Run as pid 1 in the typical Docker usage: an app container that doesn't
 // need its own init process.  Running as pid 1 allows us to monitor the
 // container app and return its exit code.
 func dockerInitApp(args *DockerInitArgs) error {
+	init := dockerInitNew(args)
+	init.Lock()
+	defer init.Unlock()
 
 	// Prepare the cmd based on the given args
-	cmdPath, err := getCmdPath(args)
-	if err != nil {
-		return err
-	}
+	// If this fails we report that below
+	cmdPath, cmdErr := getCmdPath(args)
 	cmd := exec.Command(cmdPath, args.args[1:]...)
 	cmd.Dir = args.workDir
 	cmd.Env = args.env
@@ -376,13 +541,12 @@ func dockerInitApp(args *DockerInitArgs) error {
 	// Console setup.  Hook up the container app's stdin/stdout/stderr to
 	// either a pty or pipes.  The FDs for the controlling side of the
 	// pty/pipes will be passed to docker later via a UNIX socket.
-	dockerInitConsole := dockerInitConsoleNew(args)
 	if args.tty {
 		ptyMaster, ptySlave, err := pty.Open()
 		if err != nil {
 			return err
 		}
-		dockerInitConsole.ptyMaster = ptyMaster
+		init.ptyMaster = ptyMaster
 		cmd.Stdout = ptySlave
 		cmd.Stderr = ptySlave
 		if args.openStdin {
@@ -394,13 +558,13 @@ func dockerInitApp(args *DockerInitArgs) error {
 		if err != nil {
 			return err
 		}
-		dockerInitConsole.stdout = stdout.(*os.File)
+		init.stdout = stdout.(*os.File)
 
 		stderr, err := cmd.StderrPipe()
 		if err != nil {
 			return err
 		}
-		dockerInitConsole.stderr = stderr.(*os.File)
+		init.stderr = stderr.(*os.File)
 		if args.openStdin {
 			// Can't use cmd.StdinPipe() here, since in Go 1.2 it
 			// returns an io.WriteCloser with the underlying object
@@ -411,76 +575,56 @@ func dockerInitApp(args *DockerInitArgs) error {
 				return err
 			}
 			cmd.Stdin = pipeRead
-			dockerInitConsole.stdin = pipeWrite
+			init.stdin = pipeWrite
 		}
 	}
 
-	// Start the RPC and console FD servers and wait for the resume call
-	// from docker
-	dockerInitRpc := dockerInitRpcNew()
-	if err := startServersAndWait(dockerInitRpc, dockerInitConsole); err != nil {
+	if err := runDbusServer(init); err != nil {
+		// Can't report error here, as dbus is not up...
 		return err
 	}
 
-	if err := setupCommon(args); err != nil {
-		return err
-	}
+	// Wait for docker to tell us to start
+	init.Unlock() // Allow calls
+	<-init.resume
+	init.Lock()
 
-	// Update uid/gid credentials if needed
-	credential, err := getCredential(args)
-	if err != nil {
-		return err
-	}
-	cmd.SysProcAttr.Credential = credential
+	exitCode := 1
 
-	// Start the app
-	if err := cmd.Start(); err != nil {
-		return err
-	}
+	if cmdErr != nil {
+		init.changeState(FailedToStart, cmdErr.Error(), -1)
+	} else {
+		// Container setup
+		if err := setupCommon(args); err != nil {
+			init.changeState(FailedToStart, err.Error(), -1)
+		} else {
+			// Start the app
+			if err = cmd.Start(); err != nil {
+				init.changeState(FailedToStart, err.Error(), -1)
+			} else {
+				init.process = cmd.Process
+				init.changeState(Running, "", -1)
 
-	dockerInitRpc.process = cmd.Process
-	close(dockerInitRpc.processLock)
-
-	// Forward all signals to the app
-	sigchan := make(chan os.Signal, 1)
-	utils.CatchAll(sigchan)
-	go func() {
-		for sig := range sigchan {
-			if sig == syscall.SIGCHLD {
-				continue
+				init.Unlock() // Allow calls
+				exitCode = babySit(init.process)
+				init.Lock()
+				init.changeState(Exited, "", int32(exitCode))
 			}
-			cmd.Process.Signal(sig)
-		}
-	}()
-
-	// Wait for the app to exit.  Also, as pid 1 it's our job to reap all
-	// orphaned zombies.
-	var wstatus syscall.WaitStatus
-	for {
-		var rusage syscall.Rusage
-		pid, err := syscall.Wait4(-1, &wstatus, 0, &rusage)
-		if err == nil && pid == cmd.Process.Pid {
-			break
 		}
 	}
 
-	// Update the exit code for Wait() and detect timeout if Wait() hadn't
-	// been called
-	exitCode := wstatus.ExitStatus()
-	select {
-	case dockerInitRpc.exitCode <- exitCode:
-	case <-time.After(time.Second):
-		return fmt.Errorf("timeout waiting for docker Wait()")
-	}
+	init.Unlock() // Allow calls
 
 	// Wait for docker to call Resume() again.  This gives docker a chance
 	// to get the exit code from the RPC socket call interface before we
 	// die.
 	select {
-	case <-dockerInitRpc.resume:
+	case <-init.resume:
 	case <-time.After(time.Second):
 		return fmt.Errorf("timeout waiting for docker Resume()")
 	}
+
+	init.Lock()
 
 	os.Exit(exitCode)
 	return nil
@@ -568,36 +712,44 @@ func dockerInitMachineParent(args *DockerInitArgs) error {
 // Long-running non-pid-1 dockerinit for the machine container case.  Started
 // by dockerInitMachineParent().
 func dockerInitMachineChild(args *DockerInitArgs) error {
+	init := dockerInitNew(args)
+	init.Lock()
+	defer init.Unlock()
 
-	// Create the RPC struct to monitor pid 1 and send signals to it
-	dockerInitRpc := dockerInitRpcNew()
 	var err error
-	dockerInitRpc.process, err = os.FindProcess(1)
+	init.process, err = os.FindProcess(1)
 	if err != nil {
 		return err
 	}
-	close(dockerInitRpc.processLock)
 
 	// Create the dockerInitConsole struct and pass it the ptyMaster that
 	// was sent by dockerInitMachineParent()
-	dockerInitConsole := dockerInitConsoleNew(args)
-	dockerInitConsole.ptyMaster = os.NewFile(3, "ptyMaster")
+	init.ptyMaster = os.NewFile(3, "ptyMaster")
 
-	// Start the RPC and console FD servers and wait for the resume call
-	// from docker
-	if err := startServersAndWait(dockerInitRpc, dockerInitConsole); err != nil {
+	if err := runDbusServer(init); err != nil {
+		// Can't report error here, as dbus is not up...
 		return err
 	}
+
+	// Wait for docker to tell us to start
+	init.Unlock() // Allow calls
+	<-init.resume
+	init.Lock()
 
 	// We're ready now.  Tell dockerInitMachineParent() to exec the real init.
-	if err := dockerInitRpc.process.Signal(syscall.SIGUSR1); err != nil {
+	if err := init.process.Signal(syscall.SIGUSR1); err != nil {
 		return err
 	}
 
+	init.changeState(Running, "", -1)
+
+	init.Unlock() // Allow calls
 	// Sleep forever while the servers run...
 	for {
 		time.Sleep(time.Hour)
 	}
+	init.Lock()
+	return nil
 }
 
 // Sys Init code

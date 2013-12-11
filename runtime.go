@@ -182,7 +182,7 @@ func (runtime *Runtime) Register(container *Container) error {
 			}
 
 			container.waitLock = make(chan struct{})
-			container.rpcLock = make(chan struct{})
+			container.initLock = make(chan struct{})
 			container.ptyLock = make(chan struct{})
 
 			go container.monitor(true)

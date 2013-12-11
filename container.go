@@ -9,11 +9,11 @@ import (
 	"github.com/dotcloud/docker/sysinit"
 	"github.com/dotcloud/docker/term"
 	"github.com/dotcloud/docker/utils"
+	"github.com/guelfey/go.dbus"
 	"io"
 	"io/ioutil"
 	"log"
 	"net"
-	"net/rpc"
 	"os"
 	"os/exec"
 	"path"
@@ -74,9 +74,8 @@ type Container struct {
 
 	activeLinks map[string]*Link
 
-	dockerInitRpcSocket net.Conn // needed to prevent rpc FD leak bug
-	dockerInitRpc       *rpc.Client
-	rpcLock             chan struct{}
+	initLock   chan struct{}
+	dockerInit *sysinit.DockerInitWrapper
 }
 
 // Note: the Config structure should hold only portable information about the container.
@@ -668,7 +667,7 @@ func (container *Container) Start() (err error) {
 
 	// Init the locks
 	container.waitLock = make(chan struct{})
-	container.rpcLock = make(chan struct{})
+	container.initLock = make(chan struct{})
 	container.ptyLock = make(chan struct{})
 
 	go container.monitor(false)
@@ -676,37 +675,27 @@ func (container *Container) Start() (err error) {
 	return nil
 }
 
-func (container *Container) dockerInitRpcCall(method string, args, reply interface{}) error {
-
-	select {
-	case <-container.rpcLock:
-	case <-time.After(time.Second):
-		close(container.rpcLock)
-		return fmt.Errorf("timeout waiting for rpc connection")
-	}
-
-	if container.dockerInitRpc == nil {
-		return fmt.Errorf("no rpc connection to container")
-	}
-
-	return container.dockerInitRpc.Call("DockerInitRpc."+method, args, reply)
-}
-
-// Connect to the dockerinit RPC socket and hook up the console FDs
+// Connect to the dockerinit dbus socket and hook up the console FDs
 func (container *Container) connectToDockerInit(reconnect bool) error {
 
 	// We can't connect to the dockerinit RPC socket file directly because
 	// the path to it is longer than 108 characters (UNIX_PATH_MAX).
 	// Create a temporary symlink to connect to.
 	symlink := "/tmp/docker-rpc." + container.ID
-	os.Symlink(path.Join(container.SharedPath, sysinit.RpcSocketName), symlink)
+	os.Symlink(path.Join(container.SharedPath, sysinit.DBusSocketName), symlink)
 	defer os.Remove(symlink)
+	dbusPath := "unix:path=" + symlink
 
-	// Connect to the dockerinit RPC socket with a 1 second timeout
 	var err error
 	for startTime := time.Now(); time.Since(startTime) < time.Second; time.Sleep(10 * time.Millisecond) {
-		if container.dockerInitRpcSocket, err = net.Dial("unix", symlink); err == nil {
-			container.dockerInitRpc = rpc.NewClient(container.dockerInitRpcSocket)
+		if conn, err := dbus.Dial(dbusPath); err == nil {
+			// Create this before authenticate so we can connect to the
+			// signal without race conditions
+			wrap := sysinit.DockerInitWrap(conn)
+			if err := conn.Auth(nil); err != nil {
+				return err
+			}
+			container.dockerInit = wrap
 			break
 		}
 
@@ -719,62 +708,14 @@ func (container *Container) connectToDockerInit(reconnect bool) error {
 		return err
 	}
 
-	close(container.rpcLock)
-
-	if !reconnect {
-		// Tell dockerinit to start the app now
-		var dummy1, dummy2 int
-		if err := container.dockerInitRpcCall("Resume", &dummy1, &dummy2); err != nil {
-			return err
-		}
-	}
-
-	// This is the same long socket path name workaround as above
-	symlink = "/tmp/docker-con." + container.ID
-	os.Symlink(path.Join(container.SharedPath, sysinit.ConsoleSocketName), symlink)
-	defer os.Remove(symlink)
-
-	// Connect to the console FD passing socket
-	addr := &net.UnixAddr{Net: "unix", Name: symlink}
-	conn, err := net.DialUnix("unix", nil, addr)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	// Get the console FDs
-	buf := make([]byte, 1)
-	oob := make([]byte, 32)
-	timeout := time.AfterFunc(time.Second, func() {
-		utils.Errorf("%s: console socket timeout", container.ID)
-		conn.Close()
-	})
-	_, oobn, _, _, err := conn.ReadMsgUnix(buf, oob)
-	timeout.Stop()
-	if err != nil {
-		return err
-	}
-	messages, err := syscall.ParseSocketControlMessage(oob[:oobn])
-	if err != nil {
-		return err
-	}
-	fds, err := syscall.ParseUnixRights(&messages[0])
-	if err != nil {
-		return err
-	}
-
-	// Set the CLOEXEC flag on the FDs so they won't be leaked into future
-	// lxc-start incantations
-	for i := range fds {
-		if _, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fds[i]), syscall.F_SETFD, syscall.FD_CLOEXEC); errno != 0 {
-			return errno
-		}
-	}
-
 	// Hook up the console FDs to the container struct for logging and
 	// attaching
 	if container.Config.Tty {
-		container.ptyMaster = os.NewFile(uintptr(fds[0]), "ptyMaster")
+		if pty, err := container.dockerInit.GetPtyMaster(); err != nil {
+			return err
+		} else {
+			container.ptyMaster = pty
+		}
 		close(container.ptyLock)
 
 		if container.Config.OpenStdin {
@@ -788,22 +729,26 @@ func (container *Container) connectToDockerInit(reconnect bool) error {
 			container.ptyMaster.Close()
 		}()
 	} else {
-		stdout := os.NewFile(uintptr(fds[0]), "stdout")
-		stderr := os.NewFile(uintptr(fds[1]), "stderr")
-		go func() {
-			io.Copy(container.stdout, stdout)
-			stdout.Close()
-		}()
-		go func() {
-			io.Copy(container.stderr, stderr)
-			stderr.Close()
-		}()
-		if container.Config.OpenStdin && len(fds) == 3 {
-			stdin := os.NewFile(uintptr(fds[2]), "stdin")
+		if stdout, stderr, err := container.dockerInit.GetStdOut(); err != nil {
+			return err
+		} else {
 			go func() {
-				io.Copy(stdin, container.stdin)
-				stdin.Close()
+				io.Copy(container.stdout, stdout)
+				stdout.Close()
 			}()
+			go func() {
+				io.Copy(container.stderr, stderr)
+				stderr.Close()
+			}()
+		}
+
+		if container.Config.OpenStdin {
+			if stdin, err := container.dockerInit.GetStdIn(); err == nil {
+				go func() {
+					io.Copy(stdin, container.stdin)
+					stdin.Close()
+				}()
+			}
 		}
 	}
 
@@ -1188,7 +1133,6 @@ func (container *Container) releaseNetwork() {
 
 // Wait for the program to exit
 func (container *Container) monitor(reconnect bool) {
-
 	exitCode := -1
 
 	// Connect to the dockerinit socket and wait for the exit code
@@ -1198,16 +1142,32 @@ func (container *Container) monitor(reconnect bool) {
 
 		utils.Debugf("monitor: waiting for container %s", container.ID)
 
-		var dummy1 int
-		if err := container.dockerInitRpcCall("Wait", &dummy1, &exitCode); err != nil {
-			// Since non-zero exit status and signal terminations
-			// will cause err to be non-nil, we have to actually
-			// discard it. Still, log it anyway, just in case.
-			utils.Debugf("monitor: rpc wait exit status %s for container %s", err, container.ID)
-		} else {
-			// Wait returned, now tell dockerinit it can die
-			var dummy2 int
-			container.dockerInitRpcCall("Resume", &dummy1, &dummy2)
+		for exitCode == -1 {
+			state, errStr, exit := container.dockerInit.WaitForStateChange()
+			utils.Debugf("monitor: new State for %s: %d %s %d", container.ID, state, errStr, exit)
+
+			switch state {
+			case sysinit.Initial:
+				// Tell dockerinit it can start
+				container.dockerInit.Resume()
+
+			case sysinit.Running:
+				// running, allow other calls now
+				close(container.initLock)
+
+			case sysinit.Exited:
+				exitCode = exit
+
+				// Tell dockerinit it can die
+				container.dockerInit.Resume()
+
+			case sysinit.FailedToStart:
+				utils.Errorf("Failed to start container: %s\n", errStr)
+
+				exitCode = 1
+				// Tell dockerinit it can die
+				container.dockerInit.Resume()
+			}
 		}
 
 		utils.Debugf("monitor: container %s finished", container.ID)
@@ -1284,26 +1244,28 @@ func (container *Container) cleanup() {
 		}
 	}
 
-	if container.dockerInitRpc != nil {
-		if err := container.dockerInitRpc.Close(); err != nil {
-			// FIXME: Prevent an FD leak by closing the socket
-			// directly.  Due to a Go bug, rpc client Close()
-			// returns an error if the connection has closed on the
-			// other end, and doesn't close the actual socket FD.
-			//
-			// https://code.google.com/p/go/issues/detail?id=6897
-			//
-			if err := container.dockerInitRpcSocket.Close(); err != nil {
-				utils.Errorf("%s: Error closing RPC socket: %s", container.ID, err)
-			}
-		}
-		container.dockerInitRpc = nil
-		container.dockerInitRpcSocket = nil
+	if container.dockerInit != nil {
+		container.dockerInit.Close()
+		container.dockerInit = nil
 	}
 
 	if err := container.Unmount(); err != nil {
 		log.Printf("%v: Failed to umount filesystem: %v", container.ID, err)
 	}
+}
+
+// Ensure that we have a dockerInit, in the running state
+func (container *Container) ensureInit() error {
+	select {
+	case <-container.initLock:
+	case <-time.After(time.Second):
+		return fmt.Errorf("timeout waiting for dockerinit connection")
+	}
+
+	if container.dockerInit == nil {
+		return fmt.Errorf("no connection to container")
+	}
+	return nil
 }
 
 func (container *Container) kill(sig int) error {
@@ -1314,8 +1276,11 @@ func (container *Container) kill(sig int) error {
 		return nil
 	}
 
-	var dummy int
-	if err := container.dockerInitRpcCall("Signal", sig, &dummy); err != nil {
+	if err := container.ensureInit(); err != nil {
+		return err
+	}
+
+	if err := container.dockerInit.Signal(sig); err != nil {
 		log.Printf("error killing container %s (%s)", utils.TruncateID(container.ID), err)
 		return err
 	}
